@@ -818,7 +818,9 @@ mod target_dir_tests {
         package(&elsewhere, "snake");
         dep_info(&other, &[&elsewhere.join("src/main.rs")]);
         assert_eq!(built_program_in(&app, env), Some(own.clone()), "a record of another project's sources");
-        let copy_elsewhere = d.path().join("backup").join(std::path::absolute(&app).unwrap().strip_prefix("/").unwrap_or(&app)).join("src/main.rs");
+        // The app's path without its root or drive, so it stays relative on every system.
+        let suffix: PathBuf = std::path::absolute(&app).unwrap().components().filter(|c| matches!(c, std::path::Component::Normal(_))).collect();
+        let copy_elsewhere = d.path().join("backup").join(suffix).join("src/main.rs");
         dep_info(&other, &[&copy_elsewhere]);
         assert_eq!(built_program_in(&app, env), Some(own.clone()), "the same path under another folder isn't the project");
         dep_info(&other, &[&app.join("src/main.rs")]);

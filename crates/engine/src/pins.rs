@@ -157,8 +157,10 @@ impl Pin {
             return Ok((program, Vec::new()));
         }
         // A pin from before programs were recorded: its own copy decides, not where Cargo builds
-        // the project now (a global target-dir would point at the latest build).
-        crate::outputs::launch_inside(&app, godot).ok_or_else(|| {
+        // the project now (a global target-dir would point at the latest build). A saved Live pin
+        // has no copy: it starts the project's app, whose build may be wherever Cargo put it.
+        let found = if self.mode.keeps_copy() { crate::outputs::launch_inside(&app, godot) } else { crate::outputs::launch(&app, godot) };
+        found.ok_or_else(|| {
             ToolError::new(ErrorCode::NotFound, "There's nothing to start: no built program in this pin.")
                 .with_remediation("Pin a working build or open the folder to look.")
         })
@@ -696,6 +698,30 @@ mod tests {
         mark_program(&newer);
         std::fs::write(newer.with_extension("d"), format!("{}: {}\n", newer.display(), ws.app_dir().join("src/main.rs").display())).unwrap();
         assert_eq!(pin.launch(&ws, None).unwrap().0, own, "the pin's own copy, not the project's newest build");
+    }
+
+    /// A saved Live pin (made before they were retired) starts the project's own app, so it finds
+    /// the project's build wherever Cargo puts it, as Play does: here a target directory set above
+    /// the project.
+    #[test]
+    fn a_saved_live_pin_finds_the_projects_build_outside_the_app() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Snake", "a snake game", TargetRef::None).unwrap();
+        let app = ws.app_dir();
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"live-probe\"\n").unwrap();
+        std::fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::create_dir_all(app.join(".cargo")).unwrap();
+        std::fs::write(app.join(".cargo/config.toml"), "[build]\ntarget-dir = \"../shared-out\"\n").unwrap();
+        let shared = ws.root.join("shared-out/debug");
+        std::fs::create_dir_all(&shared).unwrap();
+        let program = shared.join(exe("live-probe"));
+        std::fs::write(&program, b"program").unwrap();
+        mark_program(&program);
+        std::fs::write(shared.join("live-probe.d"), format!("{}: {}\n", program.display(), app.join("src/main.rs").display())).unwrap();
+        let live = read_pin(br#"{"id":2,"name":"A","mode":"live","created_ms":5}"#).unwrap();
+        assert_eq!(live.app_dir(&ws), app, "a Live pin runs the project's own app");
+        assert_eq!(live.launch(&ws, None).unwrap().0, program);
     }
 
     /// R5.7: a named program built outside the app (a moved Cargo target directory) is copied into

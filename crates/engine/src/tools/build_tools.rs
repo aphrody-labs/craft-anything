@@ -293,10 +293,21 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
 
 /// Read a project file a builder can hold in memory, with a plain error for one over the cap.
 fn read_file_for_builder(path: &Path, shown: &str) -> Result<Vec<u8>, ToolError> {
+    capped_for_builder(path, shown, "read", "Read a smaller file, or use a build command to print the part you need.")
+}
+
+/// Read a project file as text for an edit, refusing one over the same cap before it is loaded.
+fn read_text_for_edit(path: &Path, shown: &str) -> Result<String, ToolError> {
+    let bytes = capped_for_builder(path, shown, "edit", "Edit a smaller file, or use a build command to change it.")?;
+    String::from_utf8(bytes).map_err(|e| ToolError::io(path.display(), std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
+/// Read a whole project file with the builder's memory cap, so no path loads an oversized file.
+fn capped_for_builder(path: &Path, shown: &str, action: &str, remedy: &str) -> Result<Vec<u8>, ToolError> {
     craft_anything_platform::fs::read_file_capped(path, MAX_READ_FILE).map_err(|e| {
         if e.code == ErrorCode::OverLimit {
-            ToolError::new(ErrorCode::OverLimit, format!("{shown} is larger than the {} MB a builder can read at once.", MAX_READ_FILE / (1024 * 1024)))
-                .with_remediation("Read a smaller file, or use a build command to print the part you need.")
+            ToolError::new(ErrorCode::OverLimit, format!("{shown} is larger than the {} MB a builder can {action} at once.", MAX_READ_FILE / (1024 * 1024)))
+                .with_remediation(remedy)
         } else {
             e
         }
@@ -363,7 +374,7 @@ fn build_file_edit(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolE
     let p: EditParams = parse_params(params)?;
     let ws = workspace(ctx)?;
     let path = in_project_or_app(&ws, &p.path, false)?;
-    let text = std::fs::read_to_string(&path).map_err(|e| ToolError::io(path.display(), e))?;
+    let text = read_text_for_edit(&path, &p.path)?;
     let count = if p.old_text.is_empty() { 0 } else { text.matches(p.old_text.as_str()).count() };
     let new = match (count, p.replace_all) {
         (0, _) => return Err(ToolError::invalid(format!("old_text isn't in {}.", p.path)).with_remediation("Read the file again and copy the text exactly.")),
@@ -481,6 +492,41 @@ mod tests {
         std::fs::write(ws.app_dir().join("at-cap.txt"), "a".repeat(cap)).unwrap();
         let ok = call(&e, "build_file_read", json!({"path": "app/at-cap.txt"})).unwrap();
         assert_eq!((ok["lines"].as_u64(), ok["text"].as_str().map(str::len)), (Some(1), Some(MAX_READ + 1)));
+    }
+
+    /// An edit refuses a project file over the 16 MiB cap before reading it, and changes nothing.
+    #[test]
+    fn a_file_over_the_edit_cap_is_refused_and_left_unchanged() {
+        let (_d, ws, e) = building();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
+        let original = format!("old{}", "a".repeat(MAX_READ_FILE as usize));
+        let path = ws.app_dir().join("over-cap.txt");
+        std::fs::write(&path, &original).unwrap();
+        let err = call(&e, "build_file_edit", json!({"path": "app/over-cap.txt", "old_text": "old", "new_text": "new"})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::OverLimit);
+        assert!(err.message.contains("16 MB"), "{err:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes(), "a refused edit must not change the file");
+    }
+
+    /// A file exactly at the edit cap still reads, and an edit that fits the write cap is saved.
+    #[test]
+    fn a_file_at_the_edit_cap_can_be_edited() {
+        let (_d, ws, e) = building();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
+        let cap = MAX_READ_FILE as usize;
+        let head = "start\n";
+        let mut original = String::with_capacity(cap);
+        original.push_str(head);
+        original.push_str(&"a".repeat(cap - head.len()));
+        let path = ws.app_dir().join("at-cap.txt");
+        std::fs::write(&path, &original).unwrap();
+        // Long enough that replacing it brings the file under the 8 MB a write may hold.
+        let old = "a".repeat(9 * 1024 * 1024);
+        let out = call(&e, "build_file_edit", json!({"path": "app/at-cap.txt", "old_text": old, "new_text": "b"})).unwrap();
+        assert_eq!(out["replaced"], 1);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("start\nb"), "{:.20}", saved);
+        assert_eq!(saved.len(), cap - old.len() + 1);
     }
 
     /// "Work on my project" keeps the app in the project root: the default listing must be that
